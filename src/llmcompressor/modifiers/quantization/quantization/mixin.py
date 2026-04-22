@@ -22,7 +22,10 @@ from compressed_tensors.quantization import (
     preset_name_to_scheme,
 )
 from compressed_tensors.quantization.utils import KV_CACHE_TARGETS
-from compressed_tensors.utils import getattr_chain, match_named_modules, update_offload_parameter
+from compressed_tensors.utils import (
+    getattr_chain,
+    match_named_modules,
+)
 from pydantic import Field, PrivateAttr, field_validator
 from torch.utils.hooks import RemovableHandle
 
@@ -42,6 +45,7 @@ from llmcompressor.modifiers.quantization.group_size_validation import (
     validate_group_size_divisibility,
 )
 from llmcompressor.modifiers.utils.hooks import HooksMixin
+from llmcompressor.observers.helpers import fuse_weight_observers
 from llmcompressor.utils import (
     targets_embeddings,
     untie_word_embeddings,
@@ -72,7 +76,7 @@ class QuantizationMixin(HooksMixin):
 
     NOTE: QuantizationMixin does not update scales and zero-points on its own,
         as this is not desired for all Modifiers inheriting from it. Modifier must
-        explicitly call `module.weight_observer(module.weight)` then
+        explicitly call `module.weight_observer()` then
         `update_qparams(module, base_name="weight")` on each module.
         See QuantizationModifier.on_start method for example
 
@@ -251,6 +255,9 @@ class QuantizationMixin(HooksMixin):
             self._calibration_hooks |= self._initialize_hooks(module)
             apply_calibration_status(module)
 
+        # Link weight observers in fused groups (Q/K/V, gate/up) for shared global_scale
+        fuse_weight_observers(model)
+
         model.apply(enable_quantization)  # quantize at the same time as calibrate
 
     def end_calibration(self, model: torch.nn.Module):
@@ -266,25 +273,6 @@ class QuantizationMixin(HooksMixin):
 
         model.apply(enable_quantization)  # keep quantization enabled
 
-    def sync_activation_observers(self, model: torch.nn.Module):
-        """
-        Synchronize activation observer statistics across DDP ranks.
-        No-op when not distributed.
-
-        :param model: model containing quantized modules
-        """
-        if not is_distributed():
-            return
-
-        pending_comms = []
-        for _, module in match_named_modules(model, self.resolved_targets, self.ignore):
-            for base_name in ("input", "output", "q", "k", "v"):
-                observer = getattr(module, f"{base_name}_observer", None)
-                if observer is None:
-                    continue
-                pending_comms.extend(observer.synchronize_ranks())
-        wait_for_comms(pending_comms)
-
     def update_activation_qparams(self, model: torch.nn.Module):
         """
         Compute and store quantization parameters for all activation observers
@@ -292,6 +280,8 @@ class QuantizationMixin(HooksMixin):
 
         :param model: model containing quantized modules
         """
+        self.sync_activation_observers(model)
+
         for _, module in match_named_modules(model, self.resolved_targets, self.ignore):
             for base_name in ("input", "output", "q", "k", "v"):
                 observer = getattr(module, f"{base_name}_observer", None)
@@ -319,6 +309,25 @@ class QuantizationMixin(HooksMixin):
                     update_global_scale=update_global_scale,
                     update_scale_zp=update_scale_zp,
                 )
+
+    def sync_activation_observers(self, model: torch.nn.Module):
+        """
+        Synchronize activation observer statistics across DDP ranks.
+        No-op when not distributed.
+
+        :param model: model containing quantized modules
+        """
+        if not is_distributed():
+            return
+
+        pending_comms = []
+        for _, module in match_named_modules(model, self.resolved_targets, self.ignore):
+            for base_name in ("input", "output", "q", "k", "v"):
+                observer = getattr(module, f"{base_name}_observer", None)
+                if observer is None:
+                    continue
+                pending_comms.extend(observer.synchronize_statistics())
+        wait_for_comms(pending_comms)
 
     def has_config(self) -> bool:
         """
@@ -459,7 +468,7 @@ class QuantizationMixin(HooksMixin):
                     initialize_observer(module, base_name="k")
                     initialize_observer(module, base_name="v")
 
-        # weight observers (used by child modifier or `observe_and_update_qparams`)
+        # weight observers (used by child modifier or `update_qparams`)
         if weight:
             initialize_observer(module, base_name="weight")
 

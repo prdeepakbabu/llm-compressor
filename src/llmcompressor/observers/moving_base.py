@@ -14,7 +14,7 @@ class MovingAverageObserverBase(Observer):
     Base class for observers that use exponential moving average of statistics.
 
     Provides the averaging constant and helper method for moving average computation.
-    Subclasses implement _update_statistics with their specific logic and averaging.
+    Subclasses implement update_statistics with their specific logic and averaging.
 
     :param base_name: str used to name the observer attribute
     :param args: quantization args used to calibrate and quantize the observed value

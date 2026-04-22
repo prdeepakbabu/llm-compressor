@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Dict, List, Optional, Tuple, TypedDict
+from typing import Dict, Iterable, List, Optional, Tuple, TypedDict
 from weakref import ref
 
 import torch
@@ -35,12 +35,12 @@ class Observer(InternalModule, RegistryMixin):
     ```python
     module = ...
     observer = Observer.load_from_registry(
-        observer, base_name="weight", args=...
+        observer, base_name="weight", args=..., module=module
     )
-    qparams = observer(module.weight).get_qparams()
-    scale = qparams["scale"]
-    zero_point = qparams["zero_point"]
-    global_scale = qparams["global_scale"]
+    # Weight observers auto-use module.weight when called with no args:
+    qparams = observer().get_qparams()
+    # Or pass a value explicitly:
+    qparams = observer(some_tensor).get_qparams()
     ```
 
     :param base_name: str used to name the observer attribute
@@ -49,10 +49,6 @@ class Observer(InternalModule, RegistryMixin):
         is required to utilize existing qparams such as global_scale or g_idx
     :param **observer_kwargs: keyword arguments for observer initialization
     """
-
-    # Class attribute indicating whether this observer is memoryless
-    # Memoryless observers should override this to True
-    is_memoryless: bool = False
 
     # Dict of statistic attribute names to reduce operations for DDP synchronization
     # Subclasses should override this to specify which attributes to sync
@@ -75,11 +71,21 @@ class Observer(InternalModule, RegistryMixin):
         self.args.observer_kwargs = self.args.observer_kwargs or {}
         self.args.observer_kwargs.update(observer_kwargs)
 
-        # If True, use module's stored global_scale instead of computing from statistics
-        self._use_module_global_scale: bool = False
+        # Observers in fused groups (e.g. Q/K/V, gate/up) for shared global_scale
+        self._fused_observers: list["Observer"] = []
+
+        # Idempotency tracking: skip update_statistics if called with the same tensor
+        # needed to avoid n^2 update calls for fused observers
+        self._last_observed_id: int | None = None
+        self._last_observed_version: int | None = None
+
+    @property
+    def has_statistics(self) -> bool:
+        """Whether this observer has accumulated statistics (has been observed)."""
+        return hasattr(self, "min_vals") and hasattr(self, "max_vals")
 
     @abstractmethod
-    def _update_statistics(self, observed: torch.Tensor) -> None:
+    def update_statistics(self, observed: torch.Tensor) -> None:
         """
         Update internal observer statistics from observed tensor.
         This method should update the observer's statistic attributes
@@ -90,7 +96,7 @@ class Observer(InternalModule, RegistryMixin):
         """
         raise NotImplementedError()
 
-    def _compute_qparams_from_statistics(self) -> QParamsDict:
+    def compute_qparams_from_statistics(self) -> QParamsDict:
         """
         Compute all quantization parameters from accumulated internal statistics.
 
@@ -98,23 +104,24 @@ class Observer(InternalModule, RegistryMixin):
         Computes scale, zero_point, and global_scale (if TENSOR_GROUP strategy).
         For non-TENSOR_GROUP strategies, global_scale should be None.
 
-        If use_module_global_scale() was called, reads global_scale from the module
-        instead of recomputing it from statistics.
+        For TENSOR_GROUP, global_scale is computed from the combined statistics
+        of this observer and all fused observers (linked via fuse_with()).
 
         Subclasses can override if they need custom logic.
 
         :return: dict with keys "scale", "zero_point", and "global_scale"
         """
-        if not hasattr(self, "min_vals") or not hasattr(self, "max_vals"):
+        if not self.has_statistics:
             raise RuntimeError("No statistics available. Call observer(value) first.")
 
-        # Compute or reuse global_scale if TENSOR_GROUP strategy
-        global_scale = self._get_module_param("global_scale")
-        calculate_scale = not self._use_module_global_scale or not global_scale
-        if self.args.strategy == QuantizationStrategy.TENSOR_GROUP and calculate_scale:
-            global_absmax = torch.max(
-                -self.min_vals.min().reshape(1), self.max_vals.max().reshape(1)
-            )
+        global_scale = None
+        if self.args.strategy == QuantizationStrategy.TENSOR_GROUP:
+            # Compute absmax across this observer and all fused observers
+            global_absmax = torch.max(-self.min_vals.min(), self.max_vals.max())
+            for obs in self._fused_observers:
+                obs()
+                absmax = torch.max(-obs.min_vals.min(), obs.max_vals.max())
+                global_absmax = torch.max(global_absmax, absmax).reshape(1)
             global_scale = generate_gparam(-global_absmax, global_absmax)
 
         # Compute scale and zero_point using global_scale
@@ -132,28 +139,50 @@ class Observer(InternalModule, RegistryMixin):
         """
         Compute quantization parameters from accumulated statistics.
 
-        Computes scale, zero_point, and global_scale (for TENSOR_GROUP) all at once.
-        Returns parameters without modifying the module - caller is responsible for
-        storing them if needed.
+        If this observer hasn't been observed yet, triggers observation
+        automatically (lazy). Weight observers auto-use module.weight.
+        Fused partner observation is handled by compute_qparams_from_statistics
+        with idempotency making repeated calls free.
 
         :return: dict with keys "scale", "zero_point", and "global_scale"
         """
-        return self._compute_qparams_from_statistics()
+        self()  # mostly for weight observers
+        return self.compute_qparams_from_statistics()
 
     @torch.no_grad
-    def forward(self, observed: torch.Tensor) -> "Observer":
+    def forward(self, observed: Optional[torch.Tensor] = None) -> "Observer":
         """
         Update observer statistics from observed value.
+
+        If no value is provided and this is a weight observer, automatically
+        uses the attached module's weight tensor.
+
+        Idempotent: if called again with the same tensor (same id + _version),
+        skips the update. This makes repeated observer() calls free.
 
         To get quantization parameters, call get_qparams() after this method.
         Can be chained: observer(value).get_qparams()
 
-        :param observed: value being observed (weight, activation, or attention state)
+        :param observed: value being observed. If None and base_name is "weight",
+            uses module.weight from the attached module
         :return: self for method chaining
         """
-        g_idx = self._get_module_param("g_idx")
+        # allow observer() on weight observers
+        if observed is None and self.base_name == "weight" and self.module is not None:
+            observed = self._get_module_param("weight")
+
+        # Idempotency: skip if this exact tensor (same id + version) was
+        # already observed. This makes repeated observer() calls free.
+        if (
+            observed is None
+            or observed.numel() == 0
+            or self._already_observed(observed)
+        ):
+            return
+
+        g_idx = self._get_module_param(f"{self.base_name}_g_idx")
         observed = flatten_for_calibration(observed, self.base_name, self.args, g_idx)
-        self._update_statistics(observed)
+        self.update_statistics(observed)
         return self
 
     def _get_module_param(self, name: str) -> Optional[torch.nn.Parameter]:
@@ -161,29 +190,32 @@ class Observer(InternalModule, RegistryMixin):
             return None
 
         with align_module_device(module):
-            return getattr(module, f"{self.base_name}_{name}", None)
+            return getattr(module, f"{name}", None)
 
-    def use_module_global_scale(self) -> None:
+    def _already_observed(self, observed: torch.Tensor) -> bool:
+        obs_id = id(observed)
+        obs_ver = observed._version
+        already_observed = (
+            obs_id == self._last_observed_id and obs_ver == self._last_observed_version
+        )
+        if not already_observed:
+            self._last_observed_id = obs_id
+            self._last_observed_version = obs_ver
+        return already_observed
+
+    @staticmethod
+    def fuse(observers: Iterable["Observer"]) -> None:
         """
-        Configure observer to read global_scale from the module instead of
-        recomputing it from statistics.
+        Link all observers in the list with each other for shared global_scale.
 
-        The module's weight_global_scale becomes the single source of truth. This
-        ensures consistency across multiple quantization passes (e.g., after fusing
-        global_scale across layers but before running GPTQ).
-
-        Note: The module must have weight_global_scale set before calling get_qparams().
+        :param observers: list of observers to fuse together
         """
-        self._use_module_global_scale = True
+        for obs in observers:
+            for other in observers:
+                if other is not obs:
+                    obs._fused_observers.append(other)
 
-    def use_computed_global_scale(self) -> None:
-        """
-        Configure observer to recompute global_scale from statistics instead of
-        reading from the module (default behavior).
-        """
-        self._use_module_global_scale = False
-
-    def synchronize_ranks(self) -> List[dist.Work]:
+    def synchronize_statistics(self) -> List[dist.Work]:
         """All-reduce accumulated statistics across DDP ranks.
 
         Issues async all-reduce operations on statistic attributes specified in
@@ -191,9 +223,6 @@ class Observer(InternalModule, RegistryMixin):
 
         :return: list of async communication handles
         """
-        if self.is_memoryless:
-            return []  # Memoryless observers don't synchronize
-
         comms = []
         for attr_name, reduce_op in self._sync_dict.items():
             val = getattr(self, attr_name, None)
@@ -220,13 +249,3 @@ class Observer(InternalModule, RegistryMixin):
         :param module: the module this observer is being removed from
         """
         pass
-
-    def _check_has_global_scale(self, global_scale: Optional[torch.nn.Parameter]):
-        if (
-            self.args.strategy == QuantizationStrategy.TENSOR_GROUP
-            and global_scale is None
-        ):
-            raise ValueError(
-                "Cannot compute scale and zero points "
-                "without first computing global scale"
-            )

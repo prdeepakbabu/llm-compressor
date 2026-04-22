@@ -16,7 +16,7 @@ from safetensors.torch import save_file
 from torch.nn import Module
 
 from llmcompressor.entrypoints.model_free.lifecycle import (
-    calibrate_weights,
+    calibrate_weight,
     initialize_quantized_linear,
     validate_weight_for_quantization,
 )
@@ -24,7 +24,13 @@ from llmcompressor.entrypoints.model_free.microscale import (
     get_fused_names,
     is_microscale_scheme,
 )
-from llmcompressor.modifiers.utils.helpers import fuse_global_scales_and_adjust
+from llmcompressor.modifiers.quantization.calibration import (
+    apply_calibration_status,
+    freeze_module_quantization,
+    initialize_observer,
+    update_qparams,
+)
+from llmcompressor.observers import Observer
 
 __all__ = [
     "validate_file",
@@ -99,7 +105,7 @@ def process_file(
         module = initialize_quantized_linear(tensors[name], scheme, device)
 
         # 2. calibrate weight qparams
-        calibrate_weights(module)
+        calibrate_weight(module)
 
         # 3. compress module using qparams
         compress_module(module)
@@ -175,12 +181,16 @@ def process_file_microscale_scheme(
         # 1. initialize module with qparams (on device)
         module = initialize_quantized_linear(tensors[name], scheme, device)
 
-        # 2. calibrate scale/zp/global_scale
-        calibrate_weights(module)
+        # gather fused modules for later processing
         if name in fused_name_to_fused_index:
             fused_index = fused_name_to_fused_index[name]
             fused_modules[fused_index][name] = module
+            initialize_observer(module, "weight")
+            apply_calibration_status(module)
             continue
+
+        # 2. get module qparams
+        calibrate_weight(module)
 
         # 3. compress module using qparams
         compress_module(module)
@@ -193,17 +203,19 @@ def process_file_microscale_scheme(
 
     # Compress fused modules with shared global scale
     for named_modules in fused_modules.values():
-        # 2.1. fuse global scale and adjust weight scales
+        # 2. fuse observers and get qparams
+        Observer.fuse([mod.weight_observer for mod in named_modules.values()])
+        update_qparams(named_modules.values(), base_name="weight")
 
-        fuse_global_scales_and_adjust(list(named_modules.values()))
-
-        # 3. compress modules using microscale qparams
         for name, module in named_modules.items():
-            module_name, _ = name.rsplit(".", 1)
+            freeze_module_quantization(module)
+
+            # 3. compress module using microscale qparams
             compress_module(module)
 
             # 4. save compressed data (on cpu)
             del tensors[name]
+            module_name, _ = name.rsplit(".", 1)
             prefix = module_name + "."
             for key, value in module.state_dict(prefix=prefix).items():
                 tensors[key] = value.to("cpu")

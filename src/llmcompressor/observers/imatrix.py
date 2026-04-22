@@ -119,7 +119,7 @@ class IMatrixMSEObserver(Observer):
 
     # ------------------------------------------------------------------
 
-    def _update_statistics(self, observed: torch.Tensor) -> None:
+    def update_statistics(self, observed: torch.Tensor) -> None:
         # Perform importance-weighted MSE grid search for per-group/channel min/max
         importance_weights = self._prepare_importance(observed)
         self.min_vals, self.max_vals = _grid_search(
@@ -296,7 +296,7 @@ def _grid_search(
 
     Note: global_scale is NOT used during optimization since it cancels out when
     using FP32 scales. After optimization, global_scale is computed from the final
-    min/max values in _compute_qparams_from_statistics().
+    min/max values in compute_qparams_from_statistics().
     """
     min_val = torch.amin(observed, dim=(0, -1))
     max_val = torch.amax(observed, dim=(0, -1))

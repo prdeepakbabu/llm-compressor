@@ -1,138 +1,72 @@
 import pytest
 import torch
-from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
+from compressed_tensors.quantization import (
+    QuantizationArgs,
+    QuantizationScheme,
+    initialize_module_for_quantization,
+)
+from compressed_tensors.quantization.utils import generate_gparam
 from torch.nn import Linear, Module
 
-from llmcompressor.modifiers.utils.helpers import (
-    update_fused_layer_weight_global_scales,
+from llmcompressor.modifiers.quantization.calibration import (
+    initialize_observer,
+    update_qparams,
+)
+from llmcompressor.observers.helpers import fuse_weight_observers
+
+TENSOR_GROUP_SCHEME = QuantizationScheme(
+    targets=["Linear"],
+    weights=QuantizationArgs(
+        num_bits=4,
+        type="float",
+        strategy="tensor_group",
+        group_size=16,
+    ),
+)
+
+NON_TENSOR_GROUP_SCHEME = QuantizationScheme(
+    targets=["Linear"],
+    weights=QuantizationArgs(
+        num_bits=8,
+        type="int",
+        strategy="channel",
+    ),
 )
 
 
 class MockAttentionModule(Module):
     """Mock attention module with q_proj, k_proj, v_proj."""
 
-    def __init__(self, tensor_group_quant: bool = True):
+    def __init__(self, scheme: QuantizationScheme):
         super().__init__()
-        self.q_proj = Linear(128, 128, bias=False)
-        self.k_proj = Linear(128, 128, bias=False)
-        self.v_proj = Linear(128, 128, bias=False)
+        # Use different weight magnitudes so global_scales would differ
+        self.q_proj = Linear(64, 64, bias=False)
+        self.k_proj = Linear(64, 64, bias=False)
+        self.v_proj = Linear(64, 64, bias=False)
 
-        if tensor_group_quant:
-            scheme = QuantizationScheme(
-                targets=["Linear"],
-                weights=QuantizationArgs(
-                    num_bits=4,
-                    type="float",
-                    strategy="tensor_group",
-                    group_size=128,
-                ),
-            )
-            for proj in [self.q_proj, self.k_proj, self.v_proj]:
-                proj.quantization_scheme = scheme
-                proj.weight_global_scale = torch.nn.Parameter(
-                    torch.randn(1), requires_grad=False
-                )
-                # Add weight_scale for fusion to work
-                num_groups = proj.weight.shape[1] // 128
-                proj.weight_scale = torch.nn.Parameter(
-                    torch.ones(proj.weight.shape[0], num_groups), requires_grad=False
-                )
+        torch.manual_seed(42)
+        self.q_proj.weight.data = torch.randn(64, 64) * 1.0
+        self.k_proj.weight.data = torch.randn(64, 64) * 2.0  # larger magnitude
+        self.v_proj.weight.data = torch.randn(64, 64) * 0.5  # smaller magnitude
+
+        for proj in [self.q_proj, self.k_proj, self.v_proj]:
+            initialize_module_for_quantization(proj, scheme)
 
 
 class MockMLPModule(Module):
     """Mock MLP module with gate_proj and up_proj."""
 
-    def __init__(self, tensor_group_quant: bool = True):
+    def __init__(self, scheme: QuantizationScheme):
         super().__init__()
-        self.gate_proj = Linear(128, 256, bias=False)
-        self.up_proj = Linear(128, 256, bias=False)
+        self.gate_proj = Linear(64, 128, bias=False)
+        self.up_proj = Linear(64, 128, bias=False)
 
-        if tensor_group_quant:
-            scheme = QuantizationScheme(
-                targets=["Linear"],
-                weights=QuantizationArgs(
-                    num_bits=4,
-                    type="float",
-                    strategy="tensor_group",
-                    group_size=128,
-                ),
-            )
-            for proj in [self.gate_proj, self.up_proj]:
-                proj.quantization_scheme = scheme
-                proj.weight_global_scale = torch.nn.Parameter(
-                    torch.randn(1), requires_grad=False
-                )
-                # Add weight_scale for fusion to work
-                num_groups = proj.weight.shape[1] // 128
-                proj.weight_scale = torch.nn.Parameter(
-                    torch.ones(proj.weight.shape[0], num_groups), requires_grad=False
-                )
+        torch.manual_seed(99)
+        self.gate_proj.weight.data = torch.randn(128, 64) * 1.5
+        self.up_proj.weight.data = torch.randn(128, 64) * 3.0
 
-
-class MockDeepSeekMLAModule(Module):
-    """Mock DeepSeek multi-latent attention module."""
-
-    def __init__(self, tensor_group_quant: bool = True):
-        super().__init__()
-        self.q_a_proj = Linear(128, 128, bias=False)
-        self.kv_a_proj_with_mqa = Linear(128, 256, bias=False)
-
-        if tensor_group_quant:
-            scheme = QuantizationScheme(
-                targets=["Linear"],
-                weights=QuantizationArgs(
-                    num_bits=4,
-                    type="float",
-                    strategy="tensor_group",
-                    group_size=128,
-                ),
-            )
-            for proj in [self.q_a_proj, self.kv_a_proj_with_mqa]:
-                proj.quantization_scheme = scheme
-                proj.weight_global_scale = torch.nn.Parameter(
-                    torch.randn(1), requires_grad=False
-                )
-                # Add weight_scale for fusion to work
-                num_groups = proj.weight.shape[1] // 128
-                proj.weight_scale = torch.nn.Parameter(
-                    torch.ones(proj.weight.shape[0], num_groups), requires_grad=False
-                )
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    "module_class,layer_names",
-    [
-        (MockAttentionModule, ["q_proj", "k_proj", "v_proj"]),
-        (MockMLPModule, ["gate_proj", "up_proj"]),
-        (MockDeepSeekMLAModule, ["q_a_proj", "kv_a_proj_with_mqa"]),
-    ],
-)
-@pytest.mark.parametrize("tensor_group_quant", [False, True])
-def test_update_fused_layer_weight_global_scales_fuses_scales(
-    module_class, layer_names, tensor_group_quant
-):
-    """
-    Test that update_fused_layer_weight_global_scales correctly fuses
-    weight_global_scale across related layers.
-    """
-    # different global scales are set for each layer in constructor
-    module = module_class(tensor_group_quant=tensor_group_quant)
-
-    # Run the function, should still run successfully if tensor_group_quant is False
-    update_fused_layer_weight_global_scales(module)
-
-    if tensor_group_quant:
-        # All layers should now have the minimum scale
-        layers = [getattr(module, name) for name in layer_names]
-        min_scale = layers[0].weight_global_scale.data
-        for i, layer in enumerate(layers):
-            if (layer_scale := layer.weight_global_scale.data) < min_scale:
-                min_scale = layer_scale
-        for layer in layers:
-            assert torch.allclose(
-                layer.weight_global_scale.data, min_scale
-            ), f"Expected all layers to have scale {min_scale}"
+        for proj in [self.gate_proj, self.up_proj]:
+            initialize_module_for_quantization(proj, scheme)
 
 
 @pytest.mark.unit
@@ -143,48 +77,48 @@ def test_update_fused_layer_weight_global_scales_fuses_scales(
         (MockMLPModule, ["gate_proj", "up_proj"]),
     ],
 )
-def test_fusion_preserves_effective_quantization(module_class, layer_names):
+def test_fused_observers_produce_identical_global_scale(module_class, layer_names):
     """
-    Test that fusing global_scale preserves the effective quantization by
-    adjusting weight_scale proportionally.
-
-    Verifies: full_scale = weight_scale / global_scale is unchanged
+    Test that fused observers compute the same global_scale for all
+    observers in a fused group, and that it matches the expected value
+    (computed from the combined absmax of all weights).
     """
-    module = module_class(tensor_group_quant=True)
+    module = module_class(scheme=TENSOR_GROUP_SCHEME)
 
-    # Set different global_scales and weight_scales for each layer
+    # Initialize observers and link them
+    for name in layer_names:
+        layer = getattr(module, name)
+        initialize_observer(layer, "weight")
+    fuse_weight_observers(module)
+
+    # Observe weights
+    for name in layer_names:
+        layer = getattr(module, name)
+        layer.weight_observer()
+
+    # Compute qparams (all fused partners now have statistics)
+    for name in layer_names:
+        layer = getattr(module, name)
+        update_qparams(layer, base_name="weight")
+
+    # All layers should have the same global_scale
     layers = [getattr(module, name) for name in layer_names]
-    for i, layer in enumerate(layers):
-        layer.weight_global_scale = torch.nn.Parameter(
-            torch.tensor([1.0 + i * 0.5]), requires_grad=False
-        )
-        # Create weight_scale matching the weight shape for TENSOR_GROUP
-        # For TENSOR_GROUP with group_size, shape is (out_features, num_groups)
-        num_groups = layer.weight.shape[1] // 128  # group_size=128
-        layer.weight_scale = torch.nn.Parameter(
-            torch.full((layer.weight.shape[0], num_groups), 2.0 + i * 0.3),
-            requires_grad=False,
+    global_scales = [layer.weight_global_scale.data for layer in layers]
+    for i in range(1, len(global_scales)):
+        assert torch.allclose(global_scales[0], global_scales[i]), (
+            f"Layer {layer_names[i]} global_scale {global_scales[i].item():.6f} "
+            f"differs from {layer_names[0]} {global_scales[0].item():.6f}"
         )
 
-    # Compute effective full_scale before fusion
-    full_scales_before = []
-    for layer in layers:
-        full_scale = layer.weight_scale / layer.weight_global_scale
-        full_scales_before.append(full_scale.clone())
-
-    # Fuse global scales
-    update_fused_layer_weight_global_scales(module)
-
-    # Verify effective full_scale is preserved
-    for i, layer in enumerate(layers):
-        full_scale_after = layer.weight_scale / layer.weight_global_scale
-        assert torch.allclose(
-            full_scale_after, full_scales_before[i], rtol=1e-5
-        ), (
-            f"Layer {layer_names[i]}: effective quantization changed after fusion. "
-            f"Before: {full_scales_before[i][0, 0].item():.6f}, "
-            f"After: {full_scale_after[0, 0].item():.6f}"
-        )
+    # Verify the fused global_scale matches the expected value from combined absmax
+    all_absmax = max(layer.weight.data.abs().max().item() for layer in layers)
+    expected_global_scale = generate_gparam(
+        torch.tensor([-all_absmax]), torch.tensor([all_absmax])
+    )
+    assert torch.allclose(global_scales[0], expected_global_scale, rtol=1e-5), (
+        f"Fused global_scale {global_scales[0].item():.6f} doesn't match "
+        f"expected {expected_global_scale.item():.6f}"
+    )
 
 
 @pytest.mark.unit
@@ -195,44 +129,91 @@ def test_fusion_preserves_effective_quantization(module_class, layer_names):
         (MockMLPModule, ["gate_proj", "up_proj"]),
     ],
 )
-def test_fusion_preserves_forward_output(module_class, layer_names):
+def test_unfused_observers_produce_different_global_scale(module_class, layer_names):
     """
-    Test that fusing global_scale doesn't change the forward pass output.
+    Test that without fusion, observers compute different global_scales
+    (since each weight has different magnitude).
+    """
+    module = module_class(scheme=TENSOR_GROUP_SCHEME)
 
-    Since fusion adjusts weight_scale to preserve full_scale = weight_scale / global_scale,
-    the quantized output should be identical before and after fusion.
-    """
-    module = module_class(tensor_group_quant=True)
+    # Initialize observers WITHOUT linking
+    for name in layer_names:
+        layer = getattr(module, name)
+        initialize_observer(layer, "weight")
+
+    # Observe weights and compute qparams
+    for name in layer_names:
+        layer = getattr(module, name)
+        layer.weight_observer()
+        update_qparams(layer, base_name="weight")
+
+    # Layers should have different global_scales
     layers = [getattr(module, name) for name in layer_names]
+    global_scales = [layer.weight_global_scale.data for layer in layers]
+    # At least one pair should differ (weights have different magnitudes)
+    all_same = all(torch.allclose(global_scales[0], gs) for gs in global_scales[1:])
+    assert not all_same, "Expected different global_scales without fusion"
 
-    # Set different global_scales and weight_scales
-    for i, layer in enumerate(layers):
-        layer.weight_global_scale = torch.nn.Parameter(
-            torch.tensor([1.0 + i * 0.5]), requires_grad=False
-        )
-        num_groups = layer.weight.shape[1] // 128
-        layer.weight_scale = torch.nn.Parameter(
-            torch.full((layer.weight.shape[0], num_groups), 2.0 + i * 0.3),
-            requires_grad=False,
-        )
-        # Set some non-random weights for reproducibility
-        torch.manual_seed(42 + i)
-        layer.weight.data = torch.randn_like(layer.weight)
 
-    # Compute outputs before fusion
-    torch.manual_seed(123)
-    inputs = [torch.randn(4, 128) for _ in layers]
-    outputs_before = [layer(inp) for layer, inp in zip(layers, inputs)]
+@pytest.mark.unit
+def test_non_tensor_group_not_affected():
+    """
+    Test that fuse_weight_observers does not link observers for
+    non-TENSOR_GROUP quantization strategies.
+    """
+    module = MockAttentionModule(scheme=NON_TENSOR_GROUP_SCHEME)
 
-    # Fuse global scales
-    update_fused_layer_weight_global_scales(module)
+    for name in ["q_proj", "k_proj", "v_proj"]:
+        layer = getattr(module, name)
+        initialize_observer(layer, "weight")
 
-    # Compute outputs after fusion (same inputs)
-    outputs_after = [layer(inp) for layer, inp in zip(layers, inputs)]
+    # This should be a no-op for non-TENSOR_GROUP
+    fuse_weight_observers(module)
 
-    # Verify outputs are identical
-    for i, (before, after) in enumerate(zip(outputs_before, outputs_after)):
-        assert torch.allclose(before, after, rtol=1e-5, atol=1e-7), (
-            f"Layer {layer_names[i]}: forward output changed after fusion. "
-            f"Max diff: {(before - after).abs().max().item():.6e}"
-        )
+    # Verify observers have no fused partners
+    for name in ["q_proj", "k_proj", "v_proj"]:
+        layer = getattr(module, name)
+        assert len(layer.weight_observer._fused_observers) == 0
+
+
+@pytest.mark.unit
+def test_fused_recompute_after_weight_change():
+    """
+    Test that after linking, recomputing qparams with a changed weight
+    still produces a correct fused global_scale.
+    """
+    module = MockAttentionModule(scheme=TENSOR_GROUP_SCHEME)
+
+    for name in ["q_proj", "k_proj", "v_proj"]:
+        layer = getattr(module, name)
+        initialize_observer(layer, "weight")
+    fuse_weight_observers(module)
+
+    # Initial observation
+    for name in ["q_proj", "k_proj", "v_proj"]:
+        layer = getattr(module, name)
+        layer.weight_observer()
+    for name in ["q_proj", "k_proj", "v_proj"]:
+        layer = getattr(module, name)
+        update_qparams(layer, base_name="weight")
+
+    initial_gs = module.q_proj.weight_global_scale.data.clone()
+
+    # Change q_proj weight to have much larger magnitude
+    with torch.no_grad():
+        module.q_proj.weight *= 10.0
+    module.q_proj.weight_observer()
+    update_qparams(module.q_proj, base_name="weight")
+
+    # global_scale should have changed (larger weight = smaller global_scale)
+    new_gs = module.q_proj.weight_global_scale.data
+    assert not torch.allclose(
+        initial_gs, new_gs
+    ), "global_scale should change after weight magnitude change"
+
+    # Recompute k_proj — should see q_proj's new statistics via fusion
+    module.k_proj.weight_observer()
+    update_qparams(module.k_proj, base_name="weight")
+    assert torch.allclose(
+        module.q_proj.weight_global_scale.data, module.k_proj.weight_global_scale.data
+    ), "Fused observers should still produce same global_scale after recompute"

@@ -35,9 +35,10 @@ from llmcompressor.modifiers.awq.mappings import (
     AWQMapping,
     ResolvedMapping,
 )
-from llmcompressor.modifiers.quantization.calibration import observe_and_update_qparams
+from llmcompressor.modifiers.quantization.calibration import (
+    update_qparams,
+)
 from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
-from llmcompressor.modifiers.utils import update_fused_layer_weight_global_scales
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.modifiers.utils.pytorch_helpers import is_moe_model
 from llmcompressor.observers.base import Observer
@@ -256,14 +257,12 @@ class AWQModifier(Modifier, QuantizationMixin):
 
         elif event.type_ == EventType.SEQUENTIAL_EPOCH_END:
             # Run smoothing in case of sequential pipeline
-            QuantizationMixin.sync_activation_observers(self, state.model)
-            QuantizationMixin.update_activation_qparams(self, state.model)
+            self.update_activation_qparams(self, state.model)
             self._apply_smoothing(state.model)
 
         elif event.type_ == EventType.CALIBRATION_EPOCH_END:
             # Run smoothing in case of basic pipeline
-            QuantizationMixin.sync_activation_observers(self, state.model)
-            QuantizationMixin.update_activation_qparams(self, state.model)
+            self.update_activation_qparams(self, state.model)
             self._apply_smoothing(state.model)
 
             if not self.ended_:
@@ -282,14 +281,8 @@ class AWQModifier(Modifier, QuantizationMixin):
             match_named_modules(state.model, self.resolved_targets, self.ignore)
         )
 
-        # Calculate scales and zero points and global scales
-        for _, module in tqdm(named_modules, desc="Calibrating weights"):
-            observe_and_update_qparams(module, base_name="weight")
-
-        # For TENSOR_GROUP (nvfp4), fuse global scales for attention and MLP layers
-        # This is a requirement for vLLM inference.
-        for module in tqdm(state.model.modules(), desc="Fusing global scales"):
-            update_fused_layer_weight_global_scales(module)
+        # Calculate scales, zero points, and global scales
+        update_qparams([m for _, m in named_modules], base_name="weight")
 
         QuantizationMixin.end_calibration(self, state.model)
 
@@ -723,12 +716,11 @@ class AWQModifier(Modifier, QuantizationMixin):
                         continue
 
                     w_qscheme = balance_layer.quantization_scheme.weights
-                    balance_layer.weight.data.copy_(
+                    balance_layer.weight.copy_(
                         orig_layer_weights[balance_layer].to(_scalesview.device)
                         * _scalesview
                     )
-
-                    observe_and_update_qparams(balance_layer, base_name="weight")
+                    update_qparams(balance_layer, base_name="weight")
                     balance_layer.weight.data = (
                         forward_quantize(
                             balance_layer,

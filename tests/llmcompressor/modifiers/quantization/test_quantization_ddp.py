@@ -49,7 +49,7 @@ def test_observer_synchronize_reduces_min_max():
         else torch.tensor([15.0, 10.0], device="cuda")
     )
 
-    comms = observer.synchronize_ranks()
+    comms = observer.synchronize_statistics()
     wait_for_comms(comms)
 
     # after sync, min should be element-wise minimum, max element-wise maximum
@@ -77,7 +77,7 @@ def test_synced_qparams_are_identical_across_ranks():
         else torch.tensor([1.0], device="cuda")
     )
 
-    comms = observer.synchronize_ranks()
+    comms = observer.synchronize_statistics()
     wait_for_comms(comms)
 
     qparams = observer.get_qparams()

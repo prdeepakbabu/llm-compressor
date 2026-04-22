@@ -15,8 +15,9 @@ from compressed_tensors.quantization.utils import (
     maybe_pad_tensor_for_block_quant,
     strategy_cdiv,
 )
+from torch.nn import Module
 
-__all__ = ["flatten_for_calibration"]
+__all__ = ["flatten_for_calibration", "fuse_weight_observers", "FUSED_LAYER_NAMES"]
 
 
 def flatten_for_calibration(
@@ -156,3 +157,48 @@ def _flatten_attention(value: torch.Tensor, args: QuantizationArgs):
         return value.transpose(1, 2).flatten(0, 1).unsqueeze(-2).unsqueeze(-2)
 
     raise ValueError(f"Unknown strategy {args.strategy}")
+
+
+# Defines which layer names should have their global_scale fused together.
+# These sets are used for TENSOR_GROUP quantization (e.g., NVFP4).
+FUSED_LAYER_NAMES = [
+    # MLP / expert layers have fused gate_up_proj
+    ("gate_proj", "up_proj"),
+    # Attention layers have fused qkv_proj
+    ("q_proj", "k_proj", "v_proj"),
+    # DeepSeek multi-latent attention has fused_qkv_a_proj
+    ("q_a_proj", "kv_a_proj_with_mqa"),
+    # MoE expert layers may use w1/w3 naming
+    ("w1", "w3"),
+]
+
+
+def fuse_weight_observers(model: Module):
+    """
+    Link weight observers across fused layer groups for shared global_scale.
+
+    For TENSOR_GROUP quantization (e.g. NVFP4), vLLM requires that fused
+    layers (Q/K/V attention, gate/up MLP) share the same global_scale.
+    This function links their observers so that get_qparams() computes
+    global_scale from the combined statistics of all observers in the group.
+
+    :param model: model whose weight observers should be linked
+    """
+    from llmcompressor.observers import Observer
+
+    for submodule in model.modules():
+        for layers_to_fuse in FUSED_LAYER_NAMES:
+            if not all(hasattr(submodule, name) for name in layers_to_fuse):
+                continue
+
+            layers = [getattr(submodule, name) for name in layers_to_fuse]
+            observers = []
+            for layer in layers:
+                obs = getattr(layer, "weight_observer", None)
+                if obs is None:
+                    break
+                if obs.args.strategy != QuantizationStrategy.TENSOR_GROUP:
+                    break
+                observers.append(obs)
+            else:
+                Observer.fuse(observers)

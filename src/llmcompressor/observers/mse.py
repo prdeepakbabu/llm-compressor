@@ -50,7 +50,7 @@ class MemorylessMSEObserver(Observer):
         self.grid = observer_kwargs.get("grid", 100.0)
         self.norm = observer_kwargs.get("norm", 2.4)
 
-    def _update_statistics(self, observed: torch.Tensor) -> None:
+    def update_statistics(self, observed: torch.Tensor) -> None:
         # Perform MSE grid search for per-group/channel min/max
         self.min_vals, self.max_vals = _grid_search_mse(
             observed,
@@ -96,7 +96,7 @@ class MovingAverageMSEObserver(MovingAverageObserverBase):
         self.grid = observer_kwargs.get("grid", 100.0)
         self.norm = observer_kwargs.get("norm", 2.4)
 
-    def _update_statistics(self, observed: torch.Tensor) -> None:
+    def update_statistics(self, observed: torch.Tensor) -> None:
         """Update exponential moving average statistics."""
         # Compute optimal min/max via MSE grid search
         min_vals, max_vals = _grid_search_mse(

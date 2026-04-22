@@ -1,11 +1,11 @@
-import tqdm
 from compressed_tensors.utils import match_named_modules
 
 from llmcompressor.core import Event, EventType, State
 from llmcompressor.modifiers import Modifier
-from llmcompressor.modifiers.quantization.calibration import observe_and_update_qparams
+from llmcompressor.modifiers.quantization.calibration import (
+    update_qparams,
+)
 from llmcompressor.modifiers.quantization.quantization.mixin import QuantizationMixin
-from llmcompressor.modifiers.utils import update_fused_layer_weight_global_scales
 
 __all__ = ["QuantizationModifier"]
 
@@ -75,16 +75,7 @@ class QuantizationModifier(Modifier, QuantizationMixin):
             match_named_modules(state.model, self.resolved_targets, self.ignore)
         )
 
-        for _, module in tqdm.tqdm(named_modules, desc="Calibrating weights"):
-            observe_and_update_qparams(module, base_name="weight")
-
-        # NOTE: update_fused_layer_weight_global_scales operates on Attention
-        # and MLP layers, not quantizable Linear layers. Rather than running
-        # on targeted modules, we need to run on all modules.
-        # Because this call is idempotent, setting all global_scales to the
-        # min value, it is ok to run potentially multiple times for all modules
-        for module in state.model.modules():
-            update_fused_layer_weight_global_scales(module)
+        update_qparams([m for _, m in named_modules], base_name="weight")
 
     def on_event(self, state: State, event: Event, **kwargs):
         if event.type_ == EventType.CALIBRATION_EPOCH_START:
@@ -92,12 +83,10 @@ class QuantizationModifier(Modifier, QuantizationMixin):
                 self.on_start(state, None)
 
         if event.type_ == EventType.SEQUENTIAL_EPOCH_END:
-            QuantizationMixin.sync_activation_observers(self, state.model)
-            QuantizationMixin.update_activation_qparams(self, state.model)
+            self.update_activation_qparams(self, state.model)
 
         if event.type_ == EventType.CALIBRATION_EPOCH_END:
-            QuantizationMixin.sync_activation_observers(self, state.model)
-            QuantizationMixin.update_activation_qparams(self, state.model)
+            self.update_activation_qparams(self, state.model)
             if not self.ended_:
                 self.on_end(state, None)
 

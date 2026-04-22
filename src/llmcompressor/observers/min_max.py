@@ -22,7 +22,7 @@ class MemorylessMinMaxObserver(Observer):
     is_memoryless = True
     _sync_dict = {}  # Memoryless - no DDP sync needed
 
-    def _update_statistics(self, observed: torch.Tensor) -> None:
+    def update_statistics(self, observed: torch.Tensor) -> None:
         """Compute and store min/max statistics from observation."""
         # Compute per-group/channel min/max
         self.min_vals, self.max_vals = _get_min_max(observed)
@@ -46,7 +46,7 @@ class StaticMinMaxObserver(MemorylessMinMaxObserver):
         "max_vals": dist.ReduceOp.MAX,
     }
 
-    def _update_statistics(self, observed: torch.Tensor) -> None:
+    def update_statistics(self, observed: torch.Tensor) -> None:
         """Update accumulated global min/max statistics."""
         # Update per-group/channel min/max
         min_vals, max_vals = _get_min_max(observed)
@@ -71,7 +71,7 @@ class MinMaxObserver(MovingAverageObserverBase):
     :param **observer_kwargs: keyword arguments for observer initialization
     """
 
-    def _update_statistics(self, observed: torch.Tensor) -> None:
+    def update_statistics(self, observed: torch.Tensor) -> None:
         """Update exponential moving average statistics."""
         # Compute per-group/channel min/max
         min_vals, max_vals = _get_min_max(observed)

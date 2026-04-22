@@ -8,14 +8,14 @@ from llmcompressor.modifiers.quantization.calibration import (
     apply_calibration_status,
     freeze_module_quantization,
     initialize_observer,
-    observe_and_update_qparams,
+    update_qparams,
 )
 from llmcompressor.observers.helpers import flatten_for_calibration
 
 __all__ = [
     "initialize_quantized_linear",
     "validate_weight_for_quantization",
-    "calibrate_weights",
+    "calibrate_weight",
 ]
 
 
@@ -47,8 +47,8 @@ def initialize_quantized_linear(
     return module
 
 
-def calibrate_weights(module: torch.nn.Linear):
+def calibrate_weight(module: torch.nn.Linear):
     initialize_observer(module, "weight")
     apply_calibration_status(module)
-    observe_and_update_qparams(module, base_name="weight")
+    update_qparams(module, base_name="weight")
     freeze_module_quantization(module)
